@@ -1,0 +1,9 @@
+; Test project for the oxidegen_lipsync addon.
+
+config_version=5
+
+[application]
+
+config/name="oxidegen lipsync"
+config/features=PackedStringArray("4.7")
+
