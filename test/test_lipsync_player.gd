@@ -198,3 +198,71 @@ func test_no_op_without_face_shapes() -> void:
 	bare.step(0.1)
 	assert_false(bare.has_face())
 	assert_false(bare.say(_wav(1.0)), "no audio player: nothing to play")
+
+
+func test_loads_a_takes_emotion_files() -> void:
+	var e := LipsyncPlayer.emotion_for(LINE + ".wav")
+	assert_almost_eq(LipsyncPlayer.sample(e[0], 1.0)[&"browInnerUp"], 0.7, 0.0001, "directed curves next to the clip")
+	assert_eq(e[1].layers.size(), 10, "a layer per emotion")
+	assert_true(e[1].layers[&"anger"][&"mouthFunnel"] is PackedFloat32Array)
+	var d := LipsyncPlayer.sample_layers(e[1], 1.0)
+	assert_almost_eq(d[&"anger"][&"browInnerUp"], -0.3, 0.0001, "deltas from neutral, signed")
+	assert_eq(d[&"fear"], {}, "an emotion that moves nothing")
+	assert_eq(LipsyncPlayer.emotion_for("res://test/fixtures/old_take.wav"), [{}, {}] as Array[Dictionary],
+		"a take timed before emotion: none")
+
+
+## Plays the fixture line from `at` seconds with its emotion files, stepped once.
+func _say_at(at: float) -> void:
+	assert_true(lips.say(_wav(3.0), LINE))
+	voice.seek(at)
+	lips.step(0.0)
+
+
+func test_plays_the_line_as_directed() -> void:
+	await _character()
+	_say_at(1.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.7, 0.0001, "the directed curves, not neutral's 0.3")
+	lips.emotion = false
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.3, 0.0001, "emotion off: the neutral curves")
+
+
+func test_a_mood_blends_the_layers_over_neutral() -> void:
+	await _character()
+	_say_at(1.0)
+	var funnel := float(lips.neutral_at(lips.line_time)[&"mouthFunnel"])
+	lips.set_mood({&"anger": 1.0}, 0.0)
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.0, 0.0001, "neutral 0.3 + anger's -0.3")
+	assert_almost_eq(_shape("mouthFunnel"), minf(funnel + 0.4, 1.0), 0.0001, "neutral + anger's +0.4")
+	lips.set_mood({"anger": 0.5, "joy": 1.0, "bogus": 1.0}, 0.0)
+	lips.step(0.0)
+	assert_almost_eq(_shape("mouthFunnel"), minf(funnel + 0.2 + 0.2, 1.0), 0.0001, "gains add; unknown emotions ignored")
+	assert_eq(lips.mood(), {&"anger": 0.5, &"joy": 1.0})
+	lips.set_mood({}, 0.0)
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.7, 0.0001, "no mood: back to the line as directed")
+
+
+func test_a_mood_eases_in() -> void:
+	await _character()
+	lips.mood_time = 0.4
+	_say_at(1.0)
+	lips.set_mood({&"anger": 1.0})
+	voice.seek(1.0)
+	lips.step(0.2)
+	assert_almost_eq(_shape("browInnerUp"), 0.35, 0.02, "halfway from directed 0.7 to angry 0.0")
+	lips.step(0.3)
+	assert_almost_eq(_shape("browInnerUp"), 0.0, 0.0001, "then all the way")
+
+
+func test_a_take_without_emotion_plays_neutral_whatever_the_mood() -> void:
+	await _character()
+	var c := LipsyncPlayer.curves_for(LINE + ".wav")
+	voice.stream = _wav(3.0)
+	voice.play(1.0)
+	lips.play_line(voice, c[0], c[1])
+	lips.set_mood({&"anger": 1.0}, 0.0)
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.3, 0.0001, "no layers: the mood has nothing to blend")

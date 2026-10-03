@@ -10,6 +10,9 @@ A small Godot 4 addon that makes a character's face speak a voiced line: it driv
   (`jawOpen_mouthClose = min(jawOpen, mouthClose)`).
 - Eases the face back to neutral when the line ends or its audio stops.
 - Adds **idle blinks** every few seconds, except while a line's own face curves blink the eyes.
+- Plays a line **as directed**: the face carries the feeling oxidegen read from the take's direction
+  (its `directed_curves`), and `set_mood()` can give a line **another mood live** by blending its
+  per-emotion `emotion_layers` over the neutral curves.
 - Works for any character whose meshes carry ARKit-named blend shapes; on meshes without any it does
   nothing.
 
@@ -25,7 +28,24 @@ version holds, next to the audio:
 | `<take>_line_lipsync.json` | words and ARPAbet phonemes with times (`oxidegen.lipsync/1`) |
 | `<take>_line_mouth_curves.json` | mouth, jaw, `cheekPuff`, `tongueOut` weights per ARKit name, 30 fps (`oxidegen.mouth_curves/1`) |
 | `<take>_line_face_curves.json` | the upper face (brows, eyes, nose), same shape (`oxidegen.face_curves/1`) |
+| `<take>_line_directed_curves.json` | every channel, played WITH the line's emotion, same shape (`oxidegen.directed_curves/1`; absent for a neutral line) |
+| `<take>_line_emotion_layers.json` | per emotion, the change from neutral with it at full strength (`oxidegen.emotion_layers/1`) |
+| `<take>_line_emotion.json` | the emotion track itself: the starting mix and the words it changes on (`oxidegen.emotion/1`; not needed to play) |
 
+`mouth_curves` + `face_curves` are the **neutral** performance. The emotion files come with takes timed by
+oxidegen prod v100 or later (2026-10-03); re-time an older take with `lipsync_line` to get them. The ten
+emotions (Audio2Face-3D's): amazement, anger, cheekiness, disgust, fear, grief, joy, outofbreath, pain,
+sadness. A layers file:
+
+```json
+{"format": "oxidegen.emotion_layers/1", "fps": 30, "frames": 119, "duration": 3.92,
+ "emotions": ["amazement", "anger", "..."],
+ "layers": {"anger": {"browDownLeft": [0.0, 0.41, "..."], "noseSneerLeft": ["..."]}, "joy": {"...": []}}}
+```
+
+A channel's weight with a mood = clamp(neutral + Σ gain[emotion] × layers[emotion][channel], 0, 1).
+Audio2Face's emotion isn't linear, so this approximates what a take *directed* that way would look like;
+`directed_curves` is the exact performance for the line's own direction.
 The curves come from NVIDIA Audio2Face-3D. Both curve files have the same shape: channel-major arrays,
 frame `i` at `i / fps` seconds from the start of the audio, values 0..1; only channels that move are
 present.
@@ -41,7 +61,8 @@ present.
     POST /v1/versions/{take version id}/lipsync     (Authorization: Bearer <token>)
 
 returns a job; when it finishes, the line asset has a NEW version with the same audio (same blob) plus
-the three files above. Download them with `GET /v1/blobs/{sha256}`.
+the files above. Download them with `GET /v1/blobs/{sha256}`. `lipsync_line` also takes an `emotion`
+(`"neutral"`, a mix like `{"anger": 0.6}`, or changes on words) to re-time a take with a different feeling.
 
 ## The face: what the character's mesh needs
 
@@ -69,6 +90,8 @@ Put the curves files next to the clip, named after it:
     res://voice/hello.wav
     res://voice/hello.mouth_curves.json
     res://voice/hello.face_curves.json
+    res://voice/hello.directed_curves.json     (optional: the line's emotion)
+    res://voice/hello.emotion_layers.json      (optional: moods at runtime)
 
 Add a `LipsyncPlayer` node to the character: `face_root` = the node holding its meshes (default: the
 parent; searched recursively), `audio_player` = the AudioStreamPlayer (2D/3D) it speaks through.
@@ -79,15 +102,24 @@ $LipsyncPlayer.say(preload("res://voice/hello.wav"))
 
 # Or, when something else already plays the audio (a dialogue system):
 var c := LipsyncPlayer.curves_for("res://voice/hello.wav")  # [mouth, face]
-$LipsyncPlayer.play_line($Voice, c[0], c[1])
+var e := LipsyncPlayer.emotion_for("res://voice/hello.wav")  # [directed, layers], {} when absent
+$LipsyncPlayer.play_line($Voice, c[0], c[1], e[0], e[1])
+
+# A mood the line wasn't directed with (eases in over mood_time; gains 0..1 per emotion, they add):
+$LipsyncPlayer.set_mood({&"anger": 0.8, &"fear": 0.2})
+# Back to the line as directed:
+$LipsyncPlayer.set_mood({})
 
 # Stop early (eases to neutral); `line_finished` fires either way.
 $LipsyncPlayer.stop_line()
 ```
 
 Settings: `release` (seconds to ease to neutral, 0.25), `blinks`, `blink_interval` (2-6 s), `blink_time`
-(0.18 s). Helpers: `load_curves(path)`, `sample(curves, t)`, `with_correctives(weights)`,
-`pose_at(t)`.
+(0.18 s), `emotion` (play a line's directed curves when it has them; default on), `mood_time` (seconds a
+`set_mood()` eases over, 0.4). A mood stays set across lines until changed; a take without emotion
+layers ignores it and plays neutral (or directed). Helpers: `load_curves(path)`, `load_layers(path)`,
+`curves_for(clip)`, `emotion_for(clip)`, `sample(curves, t)`, `sample_layers(layers, t)`,
+`with_correctives(weights)`, `neutral_at(t)`, `pose_at(t)`, `mood()`.
 
 **Exporting a game:** the `.json` curve files aren't Godot resources; add `*.json` to the export
 preset's "Filters to export non-resource files".

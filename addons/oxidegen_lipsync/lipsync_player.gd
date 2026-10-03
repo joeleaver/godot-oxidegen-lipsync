@@ -12,11 +12,16 @@ extends Node
 ## - When the line ends (or its audio stops) the shapes it drove ease back to neutral over
 ##   `release` seconds.
 ## - Idle blinks every few seconds, except while a line's face curves blink the eyes themselves.
+## - Emotion (oxidegen prod v100+): a take timed with its emotion also has directed_curves.json (every
+##   channel, played with the feeling read from its direction) and emotion_layers.json (per emotion,
+##   the change from neutral). By default the line plays its directed curves; set_mood() gives it
+##   another mood live: neutral + gain x layer for each emotion, eased in over `mood_time`.
 ##
 ##   $LipsyncPlayer.say(preload("res://voice/hello.wav"), "res://voice/hello")
 ##   # plays the clip on audio_player and its hello.mouth_curves.json / hello.face_curves.json
 ##   $LipsyncPlayer.play_line($Voice, LipsyncPlayer.load_curves(mouth_path), face_curves)
 ##   # times curves by an AudioStreamPlayer you already started
+##   $LipsyncPlayer.set_mood({&"anger": 0.8})   # this line, angrier than directed ({} = as directed)
 
 signal line_finished
 
@@ -24,6 +29,9 @@ const CORRECTIVES := {&"jawOpen_mouthClose": [&"min", &"jawOpen", &"mouthClose"]
 const BLINKS: Array[StringName] = [&"eyeBlinkLeft", &"eyeBlinkRight"]
 ## A face curve "blinks" (and idle blinks stay off) when an eyeBlink channel reaches this.
 const CURVE_BLINK := 0.5
+## Audio2Face-3D's emotions, the keys of an emotion_layers file and of set_mood().
+const EMOTIONS: Array[StringName] = [&"amazement", &"anger", &"cheekiness", &"disgust", &"fear", &"grief",
+		&"joy", &"outofbreath", &"pain", &"sadness"]
 
 ## Where the face's meshes are (every MeshInstance3D under it, recursively).
 @export var face_root: NodePath = ^".."
@@ -35,10 +43,17 @@ const CURVE_BLINK := 0.5
 @export var blinks := true
 @export var blink_interval := Vector2(2.0, 6.0)
 @export var blink_time := 0.18
+## Play a line's directed curves (its emotion) when it has them; off = the neutral curves.
+@export var emotion := true
+## Seconds to ease from one mood to another (set_mood()).
+@export var mood_time := 0.4
 
 ## The current line: its curves (load_curves()) and the player whose position times them.
 var mouth := {}
 var face := {}
+## The current line's emotion: directed curves (load_curves()) and layers (load_layers()), {} when none.
+var directed := {}
+var layers := {}
 var audio: Node  # AudioStreamPlayer, AudioStreamPlayer2D or AudioStreamPlayer3D
 ## Seconds into the current line (from the audio), -1 when none plays.
 var line_time := -1.0
@@ -50,6 +65,10 @@ var _fade := 0.0  # 1 -> 0 while easing to neutral
 var _fade_from := {}
 var _blink_in := 0.0  # seconds to the next idle blink
 var _blink_t := -1.0  # seconds into the current blink, -1 when none
+var _mood := {}  # emotion -> the gain set_mood() asked for
+var _gains := {}  # emotion -> the gain now (easing toward _mood)
+var _mood_mix := 0.0  # 0 = the line as directed, 1 = neutral + the mood's layers
+var _ease_secs := 0.4
 
 
 func _ready() -> void:
@@ -104,11 +123,47 @@ static func load_curves(path: String) -> Dictionary:
 	}
 
 
+## An oxidegen emotion_layers file: {fps, frames, duration, layers: {emotion: {name:
+## PackedFloat32Array of deltas from neutral}}}; {} when missing or not layers.
+static func load_layers(path: String) -> Dictionary:
+	if not FileAccess.file_exists(path):
+		return {}
+	var d: Variant = JSON.parse_string(FileAccess.get_file_as_string(path))
+	if not d is Dictionary or not (d as Dictionary).has("layers"):
+		return {}
+	var out := {}
+	for e: String in d.layers:
+		var ch := {}
+		for n: String in d.layers[e]:
+			ch[StringName(n)] = PackedFloat32Array(d.layers[e][n])
+		out[StringName(e)] = ch
+	var fps := float(d.get("fps", 30.0))
+	var frames := int(d.get("frames", 0))
+	return {"fps": fps, "frames": frames, "duration": float(d.get("duration", frames / fps)), "layers": out}
+
+
 ## The curves files of a line: <base>.mouth_curves.json and <base>.face_curves.json, where base is
 ## the clip's path without its extension: [mouth, face] (each {} when absent).
 static func curves_for(clip_path: String) -> Array[Dictionary]:
 	var base := clip_path.get_basename()
 	return [load_curves(base + ".mouth_curves.json"), load_curves(base + ".face_curves.json")]
+
+
+## A line's emotion files next to the clip: [<base>.directed_curves.json (load_curves()),
+## <base>.emotion_layers.json (load_layers())] (each {} when absent: a take timed before v100).
+static func emotion_for(clip_path: String) -> Array[Dictionary]:
+	var base := clip_path.get_basename()
+	return [load_curves(base + ".directed_curves.json"), load_layers(base + ".emotion_layers.json")]
+
+
+## One layer set's deltas at `t` seconds (sample() over each emotion's channels).
+static func sample_layers(l: Dictionary, t: float) -> Dictionary:
+	var out := {}
+	if l.is_empty():
+		return out
+	for e: StringName in l.layers:
+		out[e] = sample({"fps": l.fps, "curves": l.layers[e]}, t)
+	return out
 
 
 ## Every channel of `c` at `t` seconds, interpolated between frames (held at the ends).
@@ -139,11 +194,79 @@ static func with_correctives(w: Dictionary) -> Dictionary:
 	return out
 
 
-## The face's weights for the current line at `t` seconds (mouth over face where both have one).
-func pose_at(t: float) -> Dictionary:
+## The line's neutral weights at `t` (mouth over face where both have one).
+func neutral_at(t: float) -> Dictionary:
 	var w := sample(face, t)
 	w.merge(sample(mouth, t), true)
+	return w
+
+
+## The face's weights for the current line at `t` seconds: its directed curves (or neutral, without
+## them or with `emotion` off), blended toward neutral + the mood's layers while a mood is set.
+func pose_at(t: float) -> Dictionary:
+	var neutral := neutral_at(t)
+	var base := sample(directed, t) if emotion and not directed.is_empty() else neutral
+	if _mood_mix <= 0.0 or layers.is_empty():
+		return with_correctives(base)
+	var moody := neutral.duplicate()
+	var deltas := sample_layers(layers, t)
+	for e: StringName in _gains:
+		var g := float(_gains[e])
+		if g == 0.0 or not deltas.has(e):
+			continue
+		for n: StringName in deltas[e]:
+			moody[n] = float(moody.get(n, 0.0)) + g * float(deltas[e][n])
+	var w := {}
+	for n: StringName in base.keys() + moody.keys():
+		w[n] = lerpf(float(base.get(n, 0.0)), clampf(float(moody.get(n, 0.0)), 0.0, 1.0), _mood_mix)
 	return with_correctives(w)
+
+
+## Gives the line (and the lines after it) this mood: emotion -> gain 0..1 over the line's
+## emotion layers (e.g. {&"anger": 0.8, &"fear": 0.2}), eased in over `mood_time`. {} = back to the
+## line as directed. Takes without emotion layers ignore it.
+func set_mood(gains: Dictionary, ease_time := -1.0) -> void:
+	_mood = {}
+	for e in gains:
+		var k := StringName(e)
+		if EMOTIONS.has(k):
+			_mood[k] = clampf(float(gains[e]), 0.0, 1.0)
+	_ease_secs = ease_time if ease_time >= 0.0 else mood_time
+	if _ease_secs <= 0.0:
+		_gains = _mood.duplicate()
+		_mood_mix = 1.0 if _mood_on() else 0.0
+		return
+	if _mood_mix <= 0.0:
+		_gains = _mood.duplicate()  # from the line as directed: only the mix eases
+		return
+	for e: StringName in _mood:
+		if not _gains.has(e):
+			_gains[e] = 0.0  # a new emotion joins a mood already showing: it grows in
+
+
+## The mood set_mood() asked for.
+func mood() -> Dictionary:
+	return _mood.duplicate()
+
+
+func _mood_on() -> bool:
+	for e: StringName in _mood:
+		if float(_mood[e]) > 0.0:
+			return true
+	return false
+
+
+
+## Eases the mood's gains and mix toward what set_mood() asked for.
+func _ease_mood(delta: float) -> void:
+	var r := 1.0 if _ease_secs <= 0.0 else delta / _ease_secs
+	_mood_mix = move_toward(_mood_mix, 1.0 if _mood_on() else 0.0, r)
+	if _mood_mix <= 0.0:
+		_gains = _mood.duplicate()  # nothing shows: jump straight to the new gains
+		return
+	for e: StringName in _gains.keys():
+		var to := float(_mood.get(e, 0.0)) if _mood_on() else float(_gains[e])
+		_gains[e] = move_toward(float(_gains[e]), to, r)
 
 
 ## Plays `stream` on audio_player and its curves (curves_for(`curves_base`), default the stream's
@@ -152,28 +275,36 @@ func say(stream: AudioStream, curves_base := "") -> bool:
 	var p := get_node_or_null(audio_player)
 	if p == null:
 		return false
-	var c := curves_for(curves_base if curves_base != "" else stream.resource_path)
+	var base := curves_base if curves_base != "" else stream.resource_path
+	var c := curves_for(base)
+	var e := emotion_for(base)
 	p.stream = stream
 	p.play()
-	play_line(p, c[0], c[1])
+	play_line(p, c[0], c[1], e[0], e[1])
 	return true
 
 
-## Plays a line's curves timed by `player`'s position (call right after the audio starts).
-func play_line(player: Node, mouth_curves: Dictionary, face_curves := {}) -> void:
+## Plays a line's curves timed by `player`'s position (call right after the audio starts); with its
+## emotion files (emotion_for()) it plays as directed, or in the mood set_mood() set.
+func play_line(player: Node, mouth_curves: Dictionary, face_curves := {}, directed_curves := {},
+		emotion_layers := {}) -> void:
 	audio = player
 	mouth = mouth_curves
 	face = face_curves
+	directed = directed_curves
+	layers = emotion_layers
 	line_time = 0.0
 	_fade = 0.0
 
 
 ## Ends the current line: its shapes ease to neutral.
 func stop_line() -> void:
-	if mouth.is_empty() and face.is_empty():
+	if mouth.is_empty() and face.is_empty() and directed.is_empty():
 		return
 	mouth = {}
 	face = {}
+	directed = {}
+	layers = {}
 	audio = null
 	line_time = -1.0
 	_fade_from = _set.duplicate()
@@ -182,7 +313,8 @@ func stop_line() -> void:
 
 
 func duration() -> float:
-	return maxf(float(mouth.get("duration", 0.0)), float(face.get("duration", 0.0)))
+	return maxf(maxf(float(mouth.get("duration", 0.0)), float(face.get("duration", 0.0))),
+			float(directed.get("duration", 0.0)))
 
 
 ## Seconds into the audio: its playback position plus what has played since the last mix.
@@ -202,8 +334,9 @@ func _process(delta: float) -> void:
 func step(delta: float) -> void:
 	if not has_face():
 		return
+	_ease_mood(delta)
 	var w := {}
-	var playing := not (mouth.is_empty() and face.is_empty())
+	var playing := not (mouth.is_empty() and face.is_empty() and directed.is_empty())
 	if playing:
 		var t := audio_time()
 		if t < 0.0 or t > duration():
@@ -262,13 +395,14 @@ func _blink(delta: float, w: Dictionary) -> void:
 		w[n] = maxf(float(w.get(n, 0.0)), b)
 
 
-## The current line's face curves close the eyes themselves.
+## The current line's curves (face, or directed when it plays) close the eyes themselves.
 func _curves_blink() -> bool:
-	if face.is_empty():
-		return false
-	for n in BLINKS:
-		var a: PackedFloat32Array = face.curves.get(n, PackedFloat32Array())
-		for v in a:
-			if v >= CURVE_BLINK:
-				return true
+	for c: Dictionary in [face, directed if emotion else {}]:
+		if c.is_empty():
+			continue
+		for n in BLINKS:
+			var a: PackedFloat32Array = c.curves.get(n, PackedFloat32Array())
+			for v in a:
+				if v >= CURVE_BLINK:
+					return true
 	return false
