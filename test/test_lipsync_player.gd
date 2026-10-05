@@ -266,3 +266,95 @@ func test_a_take_without_emotion_plays_neutral_whatever_the_mood() -> void:
 	lips.set_mood({&"anger": 1.0}, 0.0)
 	lips.step(0.0)
 	assert_almost_eq(_shape("browInnerUp"), 0.3, 0.0001, "no layers: the mood has nothing to blend")
+
+
+const BEATS := "res://test/fixtures/beats"
+
+
+func test_loads_a_lines_expression_beats() -> void:
+	var x := LipsyncPlayer.expression_for(BEATS + ".wav")
+	assert_almost_eq(float(x.offset), -0.5, 0.0001, "frame 0 is before the audio")
+	assert_almost_eq(float(x.lead_in), 0.5, 0.0001)
+	assert_almost_eq(float(x.tail), 0.5, 0.0001)
+	assert_eq(LipsyncPlayer.expression_for(LINE + ".wav"), {}, "a take without beats: none")
+
+
+func test_the_lead_in_shows_before_the_audio_starts() -> void:
+	await _character()
+	assert_true(lips.say(_wav(3.0), BEATS))
+	assert_false(voice.playing, "the audio waits for the lead-in")
+	lips.step(0.2)
+	assert_false(voice.playing)
+	assert_almost_eq(lips.line_time, -0.3, 0.0001, "counting down to the audio")
+	lips.emotion = false
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 0.7, 0.0001, "the beat's 0.4 over the line's first face (0.3)")
+	lips.emotion = true
+	lips.step(0.0)
+	assert_almost_eq(_shape("browInnerUp"), 1.0, 0.0001, "over the directed face (0.7): clamped")
+	lips.step(0.4)
+	assert_true(voice.playing, "then the audio starts")
+	lips.step(0.0)
+	assert_almost_eq(lips.line_time, lips.audio_time(), 0.001, "and times the face from there")
+
+
+func test_no_lead_in_when_asked_or_when_beats_are_off() -> void:
+	await _character()
+	lips.lead_in = false
+	assert_true(lips.say(_wav(3.0), BEATS))
+	assert_true(voice.playing, "lead_in off: the audio starts at once")
+	voice.stop()
+	lips.step(0.0)
+	lips.expression = 0.0
+	assert_true(lips.say(_wav(3.0), BEATS))
+	assert_true(voice.playing, "expression 0: no beats, so no lead-in")
+	voice.seek(1.0)
+	lips.step(0.0)
+	assert_almost_eq(_shape("mouthFunnel"), lips.pose_at(1.0)[&"mouthFunnel"], 0.0001)
+
+
+func test_beats_add_to_the_line_by_the_expression_gain() -> void:
+	await _character()
+	var c := LipsyncPlayer.curves_for(BEATS + ".wav")
+	var x := LipsyncPlayer.expression_for(BEATS + ".wav")
+	voice.stream = _wav(3.0)
+	voice.play(1.0)
+	lips.play_line(voice, c[0], c[1], {}, {}, x)
+	lips.step(0.0)
+	var plain := float(LipsyncPlayer.sample(c[0], lips.line_time).get(&"mouthFunnel", 0.0))
+	assert_almost_eq(_shape("mouthFunnel"), clampf(plain + 0.2, 0.0, 1.0), 0.0001, "the beat on top of the line")
+	lips.expression = 0.5
+	lips.step(0.0)
+	plain = float(LipsyncPlayer.sample(c[0], lips.line_time).get(&"mouthFunnel", 0.0))
+	assert_almost_eq(_shape("mouthFunnel"), clampf(plain + 0.1, 0.0, 1.0), 0.0001, "scaled by `expression`")
+
+
+func test_the_tail_plays_after_the_audio_ends() -> void:
+	await _character()
+	watch_signals(lips)
+	lips.lead_in = false
+	assert_true(lips.say(_wav(3.0), BEATS))
+	voice.seek(2.9)
+	lips.step(0.0)
+	voice.stop()  # the audio ran out
+	lips.step(0.2)
+	assert_signal_not_emitted(lips, "line_finished", "the line isn't over: its tail plays")
+	assert_gt(lips.line_time, 3.0, "on its own clock, past the audio")
+	var held := float(LipsyncPlayer.sample(lips.directed, lips.line_time).get(&"eyeBlinkLeft", 0.0))
+	assert_almost_eq(_shape("eyeBlinkLeft"), clampf(held + 0.6, 0.0, 1.0), 0.0001, "the face it is left with")
+	lips.step(0.2)
+	assert_signal_not_emitted(lips, "line_finished")
+	lips.step(0.2)
+	assert_signal_emitted(lips, "line_finished", "after the tail")
+
+
+func test_a_line_cut_short_has_no_tail() -> void:
+	await _character()
+	watch_signals(lips)
+	lips.lead_in = false
+	assert_true(lips.say(_wav(3.0), BEATS))
+	voice.seek(1.0)
+	lips.step(0.0)
+	voice.stop()
+	lips.step(0.05)
+	assert_signal_emitted(lips, "line_finished", "stopped mid-line: it ends there")

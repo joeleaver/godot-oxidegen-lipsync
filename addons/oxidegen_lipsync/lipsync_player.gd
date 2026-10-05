@@ -16,6 +16,12 @@ extends Node
 ##   channel, played with the feeling read from its direction) and emotion_layers.json (per emotion,
 ##   the change from neutral). By default the line plays its directed curves; set_mood() gives it
 ##   another mood live: neutral + gain x layer for each emotion, eased in over `mood_time`.
+## - Expression beats (oxidegen prod v102+): expression_curves.json is the face where the character
+##   isn't speaking: the look it wears before the first word, the one it is left with after the
+##   last, an expression on a sigh or a laugh. They are added on top of whatever the line plays
+##   (x `expression`, 0 = off). The file starts `lead_in` seconds BEFORE the audio and runs `tail`
+##   seconds past it: say() shows the lead-in and then starts the audio (unless `lead_in` is off),
+##   and the line finishes after the tail.
 ##
 ##   $LipsyncPlayer.say(preload("res://voice/hello.wav"), "res://voice/hello")
 ##   # plays the clip on audio_player and its hello.mouth_curves.json / hello.face_curves.json
@@ -47,6 +53,11 @@ const EMOTIONS: Array[StringName] = [&"amazement", &"anger", &"cheekiness", &"di
 @export var emotion := true
 ## Seconds to ease from one mood to another (set_mood()).
 @export var mood_time := 0.4
+## How strongly a line's expression beats show (expression_curves.json), 0 = not at all.
+@export_range(0.0, 1.0) var expression := 1.0
+## say() shows a line's lead-in (the face before its first sound) before starting the audio. Off:
+## the audio starts at once (lines that follow each other closely).
+@export var lead_in := true
 
 ## The current line: its curves (load_curves()) and the player whose position times them.
 var mouth := {}
@@ -54,6 +65,8 @@ var face := {}
 ## The current line's emotion: directed curves (load_curves()) and layers (load_layers()), {} when none.
 var directed := {}
 var layers := {}
+## The current line's expression beats (load_curves() of expression_curves.json), {} when none.
+var beats := {}
 var audio: Node  # AudioStreamPlayer, AudioStreamPlayer2D or AudioStreamPlayer3D
 ## Seconds into the current line (from the audio), -1 when none plays.
 var line_time := -1.0
@@ -69,6 +82,8 @@ var _mood := {}  # emotion -> the gain set_mood() asked for
 var _gains := {}  # emotion -> the gain now (easing toward _mood)
 var _mood_mix := 0.0  # 0 = the line as directed, 1 = neutral + the mood's layers
 var _ease_secs := 0.4
+var _lead := 0.0  # seconds of lead-in left before say() starts the audio
+var _started := false  # the audio has played (so a stop is the line's end, not a late start)
 
 
 func _ready() -> void:
@@ -120,6 +135,10 @@ static func load_curves(path: String) -> Dictionary:
 		"frames": frames,
 		"duration": float(d.get("duration", frames / fps)),
 		"curves": curves,
+		# expression_curves: frame 0 is `offset` seconds from the audio's start (<= 0)
+		"offset": float(d.get("offset", 0.0)),
+		"lead_in": float(d.get("lead_in", 0.0)),
+		"tail": float(d.get("tail", 0.0)),
 	}
 
 
@@ -195,6 +214,12 @@ static func with_correctives(w: Dictionary) -> Dictionary:
 
 
 ## The line's neutral weights at `t` (mouth over face where both have one).
+## A line's expression beats next to the clip: <base>.expression_curves.json (load_curves(); {} when
+## absent: a take timed before v102, or a line with no feeling and no events).
+static func expression_for(clip_path: String) -> Dictionary:
+	return load_curves(clip_path.get_basename() + ".expression_curves.json")
+
+
 func neutral_at(t: float) -> Dictionary:
 	var w := sample(face, t)
 	w.merge(sample(mouth, t), true)
@@ -207,7 +232,7 @@ func pose_at(t: float) -> Dictionary:
 	var neutral := neutral_at(t)
 	var base := sample(directed, t) if emotion and not directed.is_empty() else neutral
 	if _mood_mix <= 0.0 or layers.is_empty():
-		return with_correctives(base)
+		return with_correctives(_with_beats(base, t))
 	var moody := neutral.duplicate()
 	var deltas := sample_layers(layers, t)
 	for e: StringName in _gains:
@@ -219,7 +244,17 @@ func pose_at(t: float) -> Dictionary:
 	var w := {}
 	for n: StringName in base.keys() + moody.keys():
 		w[n] = lerpf(float(base.get(n, 0.0)), clampf(float(moody.get(n, 0.0)), 0.0, 1.0), _mood_mix)
-	return with_correctives(w)
+	return with_correctives(_with_beats(w, t))
+
+
+## `w` with the line's expression beats at `t` added (x `expression`), clamped.
+func _with_beats(w: Dictionary, t: float) -> Dictionary:
+	if beats.is_empty() or expression <= 0.0:
+		return w
+	var b := sample(beats, t - float(beats.get("offset", 0.0)))
+	for n: StringName in b:
+		w[n] = clampf(float(w.get(n, 0.0)) + expression * float(b[n]), 0.0, 1.0)
+	return w
 
 
 ## Gives the line (and the lines after it) this mood: emotion -> gain 0..1 over the line's
@@ -278,35 +313,49 @@ func say(stream: AudioStream, curves_base := "") -> bool:
 	var base := curves_base if curves_base != "" else stream.resource_path
 	var c := curves_for(base)
 	var e := emotion_for(base)
+	var x := expression_for(base)
 	p.stream = stream
-	p.play()
-	play_line(p, c[0], c[1], e[0], e[1])
+	var lead := float(x.get("lead_in", 0.0)) if lead_in and expression > 0.0 else 0.0
+	if lead <= 0.0:
+		p.play()
+	play_line(p, c[0], c[1], e[0], e[1], x)
+	_lead = lead  # step() shows the lead-in, then starts the audio
+	_started = lead <= 0.0
+	if lead > 0.0:
+		line_time = -lead
 	return true
 
 
 ## Plays a line's curves timed by `player`'s position (call right after the audio starts); with its
 ## emotion files (emotion_for()) it plays as directed, or in the mood set_mood() set.
+## `expression_curves` (expression_for()) adds its beats; the audio is already playing, so there is no
+## lead-in here, only the tail after the audio ends.
 func play_line(player: Node, mouth_curves: Dictionary, face_curves := {}, directed_curves := {},
-		emotion_layers := {}) -> void:
+		emotion_layers := {}, expression_curves := {}) -> void:
 	audio = player
 	mouth = mouth_curves
 	face = face_curves
 	directed = directed_curves
 	layers = emotion_layers
+	beats = expression_curves
 	line_time = 0.0
+	_lead = 0.0
+	_started = true
 	_fade = 0.0
 
 
 ## Ends the current line: its shapes ease to neutral.
 func stop_line() -> void:
-	if mouth.is_empty() and face.is_empty() and directed.is_empty():
+	if mouth.is_empty() and face.is_empty() and directed.is_empty() and beats.is_empty():
 		return
 	mouth = {}
 	face = {}
 	directed = {}
 	layers = {}
+	beats = {}
 	audio = null
 	line_time = -1.0
+	_lead = 0.0
 	_fade_from = _set.duplicate()
 	_fade = 1.0
 	line_finished.emit()
@@ -337,14 +386,28 @@ func step(delta: float) -> void:
 	_ease_mood(delta)
 	var w := {}
 	var playing := not (mouth.is_empty() and face.is_empty() and directed.is_empty())
-	if playing:
-		var t := audio_time()
-		if t < 0.0 or t > duration():
-			stop_line()
-			playing = false
+	if playing and _lead > 0.0:  # the face before the line's first sound; then the audio starts
+		_lead -= delta
+		if _lead <= 0.0:
+			_lead = 0.0
+			_started = true
+			audio.play()
+			line_time = 0.0
 		else:
+			line_time = -_lead
+		w = pose_at(line_time)
+	elif playing:
+		var t := audio_time()
+		var tail := float(beats.get("tail", 0.0)) if expression > 0.0 else 0.0
+		if t >= 0.0 and t <= duration():
 			line_time = t
 			w = pose_at(t)
+		elif tail > 0.0 and line_time >= duration() - 0.25 and line_time + delta < duration() + tail:
+			line_time += delta  # the audio ran out: the face it is left with, on our own clock
+			w = pose_at(line_time)
+		else:
+			stop_line()
+			playing = false
 	if not playing and _fade > 0.0:
 		_fade = maxf(_fade - delta / maxf(release, 0.001), 0.0)
 		var s := smoothstep(0.0, 1.0, _fade)
